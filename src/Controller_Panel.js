@@ -1,10 +1,9 @@
 // src/Controller_Panel.js
-import { useState } from "react";
-
 // src/Controller_Panel.js
-import { useEffect, useMemo, useState } from "react";
-
+import { useMemo, useState } from "react";
 import { roar } from "./modules/Head_Function";
+import { mouthUp, mouthDown, mouthSet } from "./modules/Mouth_Function.js";
+
 import {
   walkForward,
   walkBackward,
@@ -17,93 +16,43 @@ import {
   setStride,
   setPosture,
 } from "./modules/Leg_Function";
-import { tailWag } from "./modules/Tail_Function";
-import { spineUp, spineDown } from "./modules/Spine_Function";
-import { adjustPelvis } from "./modules/Pelvis_Function";
+import { spineUp, spineDown, spineSet } from "./modules/Spine_Function";
+import { pelvisUp, pelvisDown, adjustPelvis } from "./modules/Pelvis_Function";
+import {
+  tailLeft,
+  tailRight,
+  tailCenter,
+  tailWag,
+  tailSet,
+} from "./modules/Tail_Function";
+import {
+  neckLeft,
+  neckRight,
+  neckCenter,
+  neckYawSet,
+} from "./modules/Neck_Function";
 
-// --- BLE client (NUS-like) ---
-const NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const NUS_TX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write (Web -> ESP)
-const NUS_RX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify (ESP -> Web)
-
-let g = { device: null, server: null, service: null, tx: null, rx: null };
-
-async function bleConnect(namePrefix = "Robo_Rex") {
-  if (!("bluetooth" in navigator)) throw new Error("Web Bluetooth not supported in this browser.");
-  const device = await navigator.bluetooth.requestDevice({
-    filters: [{ namePrefix }],
-    optionalServices: [NUS_SERVICE_UUID],
-  });
-  const server = await device.gatt.connect();
-  const service = await server.getPrimaryService(NUS_SERVICE_UUID);
-  const tx = await service.getCharacteristic(NUS_TX_UUID);
-  const rx = await service.getCharacteristic(NUS_RX_UUID);
-
-  await rx.startNotifications();
-  rx.addEventListener("characteristicvaluechanged", (e) => {
-    const msg = new TextDecoder().decode(e.target.value);
-    console.log("🦖 Rex → Web:", msg.trim());
-  });
-
-  device.addEventListener("gattserverdisconnected", () => {
-    console.warn("🔌 BLE disconnected");
-  });
-
-  g = { device, server, service, tx, rx };
-  return g;
-}
-
-async function bleDisconnect() {
-  try { await g.rx?.stopNotifications(); } catch {}
-  try { g.server?.disconnect(); } catch {}
-  g = { device: null, server: null, service: null, tx: null, rx: null };
-}
-
-function bleIsConnected() {
-  return !!(g.server && g.server.connected && g.tx);
-}
-
-async function bleSendLine(line) {
-  if (!bleIsConnected()) throw new Error("Not connected");
-  const data = new TextEncoder().encode(line.endsWith("\n") ? line : line + "\n");
-  const CHUNK = 18; // avoid 20B MTU issues
-  for (let i = 0; i < data.length; i += CHUNK) {
-    await g.tx.writeValue(data.slice(i, i + CHUNK));
-  }
-}
-
-async function bleSendJson(obj) {
-  return bleSendLine(JSON.stringify(obj));
-}
-
-// --------- UI Component ----------
-export default function Controller_Panel() {
-  const [isBleConnected, setIsBleConnected] = useState(bleIsConnected());
-  const [speed, setSpeed] = useState(0.7);
-  const [strideVal, setStrideVal] = useState(0.6);
-  const [lift, setLift] = useState(0.4);
-  const [turnRate, setTurnRate] = useState(0.6);
-  const [posture, setPostureVal] = useState(0.5);
+export default function Controller_Panel({ port }) {
+  // UI state
+  const [speed, setSpeed] = useState(0.7);       // 0..1
+  const [strideVal, setStrideVal] = useState(0.6); // 0..1
+  const [lift, setLift] = useState(0.4);         // 0..1
+  const [turnRate, setTurnRate] = useState(0.6); // 0..1
+  const [posture, setPostureVal] = useState(0.5);// 0..1
+  const [spineLevel, setSpineLevel] = useState(0.5); // 0..1
+  const [tailLevel, setTailLevel] = useState(0.5);   // 0..1
+  const [neckLevel, setNeckLevel] = useState(0.5);   // 0..1
   const [log, setLog] = useState([]);
+  const [mouthLevel, setMouthLevel] = useState(0.0); // 0 closed, 1 open
 
-  // "Port" shim so existing modules can keep using (port, ...)
-  const port = useMemo(() => {
-    return {
-      write: bleSendLine,
-      writeLine: bleSendLine,
-      send: bleSendLine,
-      sendJson: bleSendJson,
-    };
-  }, []);
-
-  const disabled = !isBleConnected;
+  const disabled = !port;
 
   const pushLog = (msg) =>
     setLog((l) => [...l.slice(-200), `[${new Date().toLocaleTimeString()}] ${msg}`]);
 
   async function doAction(label, fn) {
     try {
-      if (!bleIsConnected()) {
+      if (!port) {
         pushLog(`❌ ${label}: not connected`);
         return;
       }
@@ -112,44 +61,19 @@ export default function Controller_Panel() {
       pushLog(`✅ ${label} done`);
     } catch (err) {
       pushLog(`💥 ${label} error: ${err?.message || err}`);
+      // eslint-disable-next-line no-console
       console.error(label, err);
     }
   }
 
-  async function onConnect() {
-    try {
-      await bleConnect("Robo_Rex");
-      setIsBleConnected(true);
-      pushLog("✅ BLE connected");
-    } catch (e) {
-      pushLog(`❌ Connect failed: ${e?.message || e}`);
-    }
-  }
-
-  async function onDisconnect() {
-    await bleDisconnect();
-    setIsBleConnected(false);
-    pushLog("🔌 BLE disconnected");
-  }
-
-  // Keep button state in sync if user unplugs
-  useEffect(() => {
-    const t = setInterval(() => setIsBleConnected(bleIsConnected()), 1000);
-    return () => clearInterval(t);
-  }, []);
+  // Handy clamp
+  const clamp01 = useMemo(() => (v) => Math.max(0, Math.min(1, Number(v))), []);
 
   return (
     <div style={styles.wrapper}>
       <div style={styles.row}>
         <Badge connected={!disabled} />
         <h2 style={{ margin: 0 }}>Controller</h2>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-          {!isBleConnected ? (
-            <button onClick={onConnect} style={styles.btnPrimary}>🔗 Connect BLE</button>
-          ) : (
-            <button onClick={onDisconnect} style={styles.btnGray}>❌ Disconnect</button>
-          )}
-        </div>
       </div>
 
       {/* Locomotion */}
@@ -180,29 +104,37 @@ export default function Controller_Panel() {
             label={`Speed: ${speed.toFixed(2)}`}
             value={speed}
             onChange={(v) => {
-              setSpeed(v);
-              doAction("Set Gait (speed)", () => setGait(port, { speed: v, stride: strideVal, lift, mode: "walk" }));
+              const val = clamp01(v);
+              setSpeed(val);
+              // live update gait on change
+              doAction("Set Gait (speed)", () =>
+                setGait(port, { speed: val, stride: strideVal, lift, mode: "walk" })
+              );
             }}
           />
           <LabeledSlider
             label={`Turn Rate: ${turnRate.toFixed(2)}`}
             value={turnRate}
-            onChange={setTurnRate}
+            onChange={(v) => setTurnRate(clamp01(v))}
           />
           <LabeledSlider
             label={`Stride: ${strideVal.toFixed(2)}`}
             value={strideVal}
             onChange={(v) => {
-              setStrideVal(v);
-              doAction("Set Stride", () => setStride(port, v));
+              const val = clamp01(v);
+              setStrideVal(val);
+              doAction("Set Stride", () => setStride(port, val));
             }}
           />
           <LabeledSlider
             label={`Lift: ${lift.toFixed(2)}`}
             value={lift}
             onChange={(v) => {
-              setLift(v);
-              doAction("Set Gait (lift)", () => setGait(port, { speed, stride: strideVal, lift: v, mode: "walk" }));
+              const val = clamp01(v);
+              setLift(val);
+              doAction("Set Gait (lift)", () =>
+                setGait(port, { speed, stride: strideVal, lift: val, mode: "walk" })
+              );
             }}
           />
         </div>
@@ -214,11 +146,21 @@ export default function Controller_Panel() {
           <button disabled={disabled} onClick={() => doAction("Speed –", () => adjustSpeed(port, -0.05))}>
             Speed –
           </button>
+          <button
+            disabled={disabled}
+            onClick={() =>
+              doAction("Set Gait (run)", () =>
+                setGait(port, { speed: 1.2, stride: 0.5, lift: 0.3, mode: "run" })
+              )
+            }
+          >
+            Quick Run Preset
+          </button>
         </div>
       </Section>
 
-      {/* Spine / Pelvis / Tail / Head */}
-      <Section title="Body">
+      {/* Spine & Pelvis */}
+      <Section title="Spine & Pelvis">
         <div style={styles.btnRow}>
           <button disabled={disabled} onClick={() => doAction("Spine Up", () => spineUp(port))}>
             Spine ↑
@@ -226,26 +168,117 @@ export default function Controller_Panel() {
           <button disabled={disabled} onClick={() => doAction("Spine Down", () => spineDown(port))}>
             Spine ↓
           </button>
-
-          <button disabled={disabled} onClick={() => doAction("Tail Wag", () => tailWag(port))}>
-            Tail Wag 🐾
+          <button disabled={disabled} onClick={() => doAction("Pelvis Up", () => pelvisUp(port))}>
+            Pelvis ↑
           </button>
-
-          <button disabled={disabled} onClick={() => doAction("Roar", () => roar(port))}>
-            Roar 🦖
+          <button disabled={disabled} onClick={() => doAction("Pelvis Down", () => pelvisDown(port))}>
+            Pelvis ↓
           </button>
         </div>
 
-        <div style={{ ...styles.sliderCol, marginTop: 8 }}>
+        <div style={styles.sliderCol}>
+          <LabeledSlider
+            label={`Spine Level: ${spineLevel.toFixed(2)}`}
+            value={spineLevel}
+            onChange={(v) => {
+              const val = clamp01(v);
+              setSpineLevel(val);
+              doAction("Spine Set", () => spineSet(port, val));
+            }}
+          />
           <LabeledSlider
             label={`Posture: ${posture.toFixed(2)}`}
             value={posture}
             onChange={(v) => {
-              setPostureVal(v);
-              doAction("Set Posture", () => setPosture(port, v));
-              doAction("Adjust Pelvis", () => adjustPelvis(port, v));
+              const val = clamp01(v);
+              setPostureVal(val);
+              doAction("Set Posture", () => setPosture(port, val));
+              doAction("Adjust Pelvis", () => adjustPelvis(port, val));
             }}
           />
+        </div>
+      </Section>
+
+      {/* Tail */}
+      <Section title="Tail">
+        <div style={styles.btnRow}>
+          <button disabled={disabled} onClick={() => doAction("Tail Left", () => tailLeft(port))}>
+            ◀ Left
+          </button>
+          <button disabled={disabled} onClick={() => doAction("Tail Center", () => tailCenter(port))}>
+            ⦿ Center
+          </button>
+          <button disabled={disabled} onClick={() => doAction("Tail Right", () => tailRight(port))}>
+            Right ▶
+          </button>
+          <button disabled={disabled} onClick={() => doAction("Tail Wag", () => tailWag(port))}>
+            Wag 🐾
+          </button>
+        </div>
+
+        <LabeledSlider
+          label={`Tail Level: ${tailLevel.toFixed(2)}`}
+          value={tailLevel}
+          onChange={(v) => {
+            const val = clamp01(v);
+            setTailLevel(val);
+            doAction("Tail Set", () => tailSet(port, val));
+          }}
+        />
+      </Section>
+
+      {/* Neck */}
+      <Section title="Neck">
+        <div style={styles.btnRow}>
+          <button disabled={disabled} onClick={() => doAction("Neck Left", () => neckLeft(port))}>
+            ◀ Left
+          </button>
+          <button disabled={disabled} onClick={() => doAction("Neck Center", () => neckCenter(port))}>
+            ⦿ Center
+          </button>
+          <button disabled={disabled} onClick={() => doAction("Neck Right", () => neckRight(port))}>
+            Right ▶
+          </button>
+        </div>
+
+        <LabeledSlider
+          label={`Neck Yaw: ${neckLevel.toFixed(2)}`}
+          value={neckLevel}
+          onChange={(v) => {
+            const val = clamp01(v);
+            setNeckLevel(val);
+            doAction("Neck Yaw Set", () => neckYawSet(port, val));
+          }}
+        />
+      </Section>
+<Section title="Mouth">
+  <div style={styles.btnRow}>
+    <button disabled={disabled} onClick={() => doAction("Mouth Open", () => mouthUp(port))}>
+      Open ⬆
+    </button>
+    <button disabled={disabled} onClick={() => doAction("Mouth Close", () => mouthDown(port))}>
+      Close ⬇
+    </button>
+  </div>
+
+  {/* Optional slider if your firmware implements rex_mouth_set */}
+  <LabeledSlider
+    label={`Mouth Level`}
+    value={mouthLevel}
+    onChange={(v) => {
+      const val = clamp01(v);
+      setMouthLevel(val);
+      doAction("Mouth Set", () => mouthSet(port, val));
+    }}
+  />
+</Section>
+
+      {/* Head */}
+      <Section title="Head">
+        <div style={styles.btnRow}>
+          <button disabled={disabled} onClick={() => doAction("Roar", () => roar(port))}>
+            Roar 🦖
+          </button>
         </div>
       </Section>
 
@@ -277,7 +310,7 @@ function Section({ title, children }) {
 function LabeledSlider({ label, value, onChange, min = 0, max = 1, step = 0.01 }) {
   return (
     <label style={styles.sliderRow}>
-      <span style={{ width: 140 }}>{label}</span>
+      <span style={{ width: 160 }}>{label}</span>
       <input
         type="range"
         min={min}
@@ -338,24 +371,6 @@ const styles = {
     gap: 10,
     alignItems: "center",
   },
-  btnPrimary: {
-    padding: "8px 12px",
-    background: "#0d6efd",
-    border: "none",
-    color: "white",
-    borderRadius: 10,
-    cursor: "pointer",
-    fontSize: 14,
-  },
-  btnGray: {
-    padding: "8px 12px",
-    background: "#444",
-    border: "none",
-    color: "white",
-    borderRadius: 10,
-    cursor: "pointer",
-    fontSize: 14,
-  },
   logBox: {
     background: "#0b1020",
     color: "#c9d1d9",
@@ -364,7 +379,7 @@ const styles = {
     fontSize: 12,
     padding: 12,
     borderRadius: 8,
-    height: 160,
+    height: 180,
     overflow: "auto",
     border: "1px solid #22283a",
   },

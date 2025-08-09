@@ -1,88 +1,115 @@
-import { useEffect, useRef, useState } from "react";
-import ControllerPanel from "./Controller_Panel.js";
+// src/App.js
+import { useEffect, useMemo, useRef, useState } from "react";
+import Controller_Panel from "./Controller_Panel";
+
+// Nordic UART (change if your firmware uses other UUIDs)
+const NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const NUS_TX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write
+const NUS_RX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify
 
 export default function App() {
-  const [port, setPort] = useState(null);
   const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const [log, setLog] = useState([]);
-  const readerRef = useRef(null);
 
-  // Append to UI log
-  const pushLog = (line) => {
+  const deviceRef = useRef(null);
+  const serverRef = useRef(null);
+  const txRef = useRef(null);
+  const rxRef = useRef(null);
+
+  const pushLog = (line) =>
     setLog((l) => [...l.slice(-200), `[${new Date().toLocaleTimeString()}] ${line}`]);
-  };
 
-  // Connect to ESP32 over Web Serial
-  const connect = async () => {
+  async function connectBLE() {
+    if (connecting || connected) return;
     try {
-      if (!("serial" in navigator)) {
-        alert("Web Serial not supported. Use Chrome or Edge.");
+      setConnecting(true);
+      if (!("bluetooth" in navigator)) {
+        alert("Web Bluetooth not supported. Use Chrome/Edge on localhost or HTTPS.");
         return;
       }
-      const selPort = await navigator.serial.requestPort();
-      await selPort.open({ baudRate: 115200 });
-      setPort(selPort);
+
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: "Robo_Rex" }], // tweak if needed
+        optionalServices: [NUS_SERVICE_UUID],
+      });
+
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(NUS_SERVICE_UUID);
+      const tx = await service.getCharacteristic(NUS_TX_UUID);
+      const rx = await service.getCharacteristic(NUS_RX_UUID);
+
+      await rx.startNotifications();
+      rx.addEventListener("characteristicvaluechanged", (e) => {
+        const msg = new TextDecoder().decode(e.target.value);
+        pushLog(`ESP32 ▶ ${msg.trim()}`);
+      });
+
+      device.addEventListener("gattserverdisconnected", (evt) => {
+        setConnected(false);
+        pushLog(`BLE: disconnected (${evt?.target?.name || "device"})`);
+      });
+
+      deviceRef.current = device;
+      serverRef.current = server;
+      txRef.current = tx;
+      rxRef.current = rx;
+
       setConnected(true);
-      pushLog("Connected.");
-
-      // Start reader loop
-      const decoder = new TextDecoder();
-      const reader = selPort.readable.getReader();
-      readerRef.current = reader;
-
-      (async () => {
-        try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            if (value) pushLog(decoder.decode(value));
-          }
-        } catch (err) {
-          pushLog(`Read error: ${err.message}`);
-        } finally {
-          try { reader.releaseLock(); } catch {}
-        }
-      })();
+      pushLog("BLE: connected");
     } catch (err) {
-      pushLog(`Connect error: ${err.message}`);
-    }
-  };
-
-  // Graceful disconnect
-  const disconnect = async () => {
-    try {
-      if (readerRef.current) {
-        try { await readerRef.current.cancel(); } catch {}
-        try { readerRef.current.releaseLock(); } catch {}
-        readerRef.current = null;
-      }
-      if (port) {
-        try { await port.close(); } catch {}
-      }
+      pushLog(`Connect error: ${err?.message || err}`);
     } finally {
-      setConnected(false);
-      setPort(null);
-      pushLog("Disconnected.");
+      setConnecting(false);
     }
-  };
+  }
 
-  // Auto-cleanup on page unload
-  useEffect(() => {
-    const handler = () => {
-      if (port) try { port.close(); } catch {}
+  async function disconnectBLE() {
+    try { await rxRef.current?.stopNotifications(); } catch {}
+    try { await serverRef.current?.disconnect(); } catch {}
+    deviceRef.current = serverRef.current = txRef.current = rxRef.current = null;
+    setConnected(false);
+    pushLog("BLE: disconnected");
+  }
+
+  // Port shim for Controller_Panel + modules
+  const port = useMemo(() => {
+    async function sendLine(line) {
+      if (!txRef.current) throw new Error("Not connected");
+      const enc = new TextEncoder();
+      const bytes = enc.encode(line.endsWith("\n") ? line : line + "\n");
+      const CHUNK = 18; // keep under typical 20B MTU
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        await txRef.current.writeValue(bytes.slice(i, i + CHUNK));
+      }
+    }
+    async function sendJson(obj) {
+      return sendLine(JSON.stringify(obj));
+    }
+    return {
+      write: sendLine,
+      writeLine: sendLine,
+      send: sendLine,
+      sendJson,
     };
+  }, []);
+
+  useEffect(() => {
+    const handler = () => { try { serverRef.current?.disconnect(); } catch {} };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [port]);
+  }, []);
 
   return (
     <div style={{ padding: 16, fontFamily: "system-ui, sans-serif" }}>
       <header style={{ display: "flex", gap: 12, alignItems: "center" }}>
-        <h1 style={{ margin: 0 }}>Robo Rex Controller</h1>
+        <h1 style={{ margin: 0 }}>Robo Rex Controller (BLE)</h1>
         {!connected ? (
-          <button onClick={connect}>Connect</button>
+          <button onClick={connectBLE} disabled={connecting}>
+            {connecting ? "Connecting…" : "Connect BLE"}
+          </button>
         ) : (
-          <button onClick={disconnect}>Disconnect</button>
+          <button onClick={disconnectBLE}>Disconnect</button>
         )}
         <span
           style={{
@@ -103,9 +130,11 @@ export default function App() {
       <hr style={{ margin: "12px 0" }} />
 
       {connected ? (
-        <ControllerPanel port={port} />
+        <Controller_Panel port={port} />
       ) : (
-        <p>Click <b>Connect</b> to pair with your ESP32-S3 (Chrome/Edge required).</p>
+        <p>
+          Click <b>Connect BLE</b> to pair with your ESP32‑S3. (Chrome/Edge, localhost/HTTPS required)
+        </p>
       )}
 
       <section style={{ marginTop: 16 }}>
@@ -114,7 +143,8 @@ export default function App() {
           style={{
             background: "#0b1020",
             color: "#c9d1d9",
-            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+            fontFamily:
+              "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Courier New', monospace",
             fontSize: 12,
             padding: 12,
             borderRadius: 8,
@@ -133,4 +163,3 @@ export default function App() {
     </div>
   );
 }
-
