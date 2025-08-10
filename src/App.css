@@ -1,38 +1,130 @@
-.App {
-  text-align: center;
+/* src/App.css */
+
+/* Base reset + typography */
+:root {
+  --bg: #0b1020;
+  --panel: #0f162b;
+  --ink: #c9d1d9;
+  --muted: #8b949e;
+  --green-300: #c6f6d5;
+  --green-600: #38a169;
+  --green-800: #22543d;
+  --red-300: #fed7d7;
+  --red-600: #e53e3e;
+  --red-800: #742a2a;
+  --border: #22283a;
+  --ring: rgba(56, 161, 105, 0.35);
 }
 
-.App-logo {
-  height: 40vmin;
-  pointer-events: none;
+html, body, #root {
+  height: 100%;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  .App-logo {
-    animation: App-logo-spin infinite 20s linear;
-  }
+body {
+  margin: 0;
+  background: #0b0f1a;
+  color: #111827;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, "Noto Sans", "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-.App-header {
-  background-color: #282c34;
-  min-height: 100vh;
+/* App shell (optional—add className="app" to your top-level div if you want these) */
+.app {
+  padding: 16px;
+}
+
+/* Header */
+.app-header {
   display: flex;
-  flex-direction: column;
+  gap: 12px;
   align-items: center;
-  justify-content: center;
-  font-size: calc(10px + 2vmin);
-  color: white;
 }
 
-.App-link {
-  color: #61dafb;
+.app-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
 }
 
-@keyframes App-logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+/* Buttons */
+.btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: white;
+  color: #111827;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 80ms ease, box-shadow 140ms ease, background 140ms ease;
 }
+.btn:hover { box-shadow: 0 4px 18px rgba(0,0,0,0.15); }
+.btn:active { transform: translateY(1px); }
+
+.btn-primary {
+  background: #e6f4ff;
+  border-color: #b6dbff;
+}
+.btn-danger {
+  background: #ffe4e6;
+  border-color: #fecaca;
+}
+
+/* Connection badge */
+.status-badge {
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid;
+  font-size: 12px;
+  font-weight: 600;
+}
+.status-badge.connected {
+  background: var(--green-300);
+  border-color: var(--green-600);
+  color: var(--green-800);
+}
+.status-badge.disconnected {
+  background: var(--red-300);
+  border-color: var(--red-600);
+  color: var(--red-800);
+}
+
+/* Divider */
+hr {
+  border: none;
+  border-top: 1px solid #e5e7eb;
+  margin: 12px 0;
+}
+
+/* Device log */
+.log-wrap {
+  margin-top: 16px;
+}
+.log-title {
+  margin: 0 0 8px 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: #111827;
+}
+.log-box {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace;
+  font-size: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  height: 180px;
+  overflow: auto;
+  border: 1px solid var(--border);
+}
+
+/* Helper text */
+.empty-state {
+  opacity: 0.6;
+}
+
+/* Utility (optional) */
+.ml-auto { margin-left: auto; }
+.ring-green { box-shadow: 0 0 0 4px var(--ring); border-color: var(--green-600); }

@@ -1,21 +1,28 @@
 // src/App.js
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import ControllerPanel from "./ControllerPanel";
 
-// Nordic UART (change if your firmware uses other UUIDs)
-const NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const NUS_TX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write
-const NUS_RX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify
+// Use the centralized BLE client used by the controller
+import {
+  connect as bleConnect,
+  disconnect as bleDisconnect,
+  onMessage as bleOnMessage,
+  onDisconnect as bleOnDisconnect,
+  isConnected as bleIsConnected,
+} from "./modules/ble/bleClient";
 
+/**
+ * App: shows BLE connect/disconnect + device log
+ * The 4‑pane Controller is ALWAYS visible; when not connected,
+ * its arrows are disabled (ControllerPanel receives `connected`).
+ */
 export default function App() {
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [log, setLog] = useState([]);
-//Controller_Panel
-  const deviceRef = useRef(null);
-  const serverRef = useRef(null);
-  const txRef = useRef(null);
-  const rxRef = useRef(null);
+
+  const unsubMsgRef = useRef(null);
+  const unsubDiscRef = useRef(null);
 
   const pushLog = (line) =>
     setLog((l) => [
@@ -24,7 +31,7 @@ export default function App() {
     ]);
 
   async function connectBLE() {
-    if (connecting || connected) return;
+    if (connecting || bleIsConnected()) return;
     try {
       setConnecting(true);
       if (!("bluetooth" in navigator)) {
@@ -32,89 +39,55 @@ export default function App() {
         return;
       }
 
-      const device = await navigator.bluetooth.requestDevice({
-        filters: [{ namePrefix: "Robo_Rex" }], // tweak if needed
-        optionalServices: [NUS_SERVICE_UUID],
-      });
-
-      const server = await device.gatt.connect();
-      const service = await server.getPrimaryService(NUS_SERVICE_UUID);
-      const tx = await service.getCharacteristic(NUS_TX_UUID);
-      const rx = await service.getCharacteristic(NUS_RX_UUID);
-
-      await rx.startNotifications();
-      rx.addEventListener("characteristicvaluechanged", (e) => {
-        const dv = e.target?.value || new DataView(new ArrayBuffer(0));
-        const msg = new TextDecoder().decode(dv);
-        pushLog(`ESP32 ▶ ${msg.trim()}`);
-      });
-
-      device.addEventListener("gattserverdisconnected", (evt) => {
-        setConnected(false);
-        pushLog(`BLE: disconnected (${evt?.target?.name || "device"})`);
-        // Clean up globals on disconnect
-        try { delete window.bluetoothSend; } catch {}
-        try { delete window.rexSendJson; } catch {}
-      });
-
-      deviceRef.current = device;
-      serverRef.current = server;
-      txRef.current = tx;
-      rxRef.current = rx;
-
-      // --- Global send shim so UI/modules can transmit without prop drilling ---
-      // Accepts string or object (object is JSON-stringified). Appends newline.
-      window.bluetoothSend = async function send(lineOrObj) {
-        if (!txRef.current) throw new Error("Not connected");
-        const line = typeof lineOrObj === "string" ? lineOrObj : JSON.stringify(lineOrObj);
-        const enc = new TextEncoder();
-        const bytes = enc.encode(line.endsWith("\n") ? line : line + "\n");
-        const CHUNK = 18; // keep under typical 20B MTU
-        for (let i = 0; i < bytes.length; i += CHUNK) {
-          await txRef.current.writeValue(bytes.slice(i, i + CHUNK));
-        }
-      };
-      // Convenience helper for DevTools
-      window.rexSendJson = async (obj) => window.bluetoothSend(obj);
-
+      await bleConnect({ namePrefix: "Robo_Rex" });
       setConnected(true);
       pushLog("BLE: connected");
+
+      // Subscribe to incoming messages
+      unsubMsgRef.current?.();
+      unsubMsgRef.current = bleOnMessage((text) => {
+        if (text) pushLog(`ESP32 ▶ ${text}`);
+      });
+
+      // Update UI when device disconnects
+      unsubDiscRef.current?.();
+      unsubDiscRef.current = bleOnDisconnect(() => {
+        setConnected(false);
+        pushLog("BLE: disconnected");
+      });
     } catch (err) {
-      pushLog(`Connect error: ${err?.message || err}`);
-      try { delete window.bluetoothSend; } catch {}
-      try { delete window.rexSendJson; } catch {}
+      pushLog(`Connect error: ${err?.message || String(err)}`);
     } finally {
       setConnecting(false);
     }
   }
 
   async function disconnectBLE() {
-    try { await rxRef.current?.stopNotifications(); } catch {}
-    try { await serverRef.current?.disconnect(); } catch {}
-    deviceRef.current = serverRef.current = txRef.current = rxRef.current = null;
-    try { delete window.bluetoothSend; } catch {}
-    try { delete window.rexSendJson; } catch {}
-    setConnected(false);
-    pushLog("BLE: disconnected");
+    try {
+      await bleDisconnect();
+    } catch (e) {
+      // ignore
+    } finally {
+      setConnected(false);
+      pushLog("BLE: disconnected");
+      // Clean up subscriptions
+      try { unsubMsgRef.current?.(); } catch {}
+      try { unsubDiscRef.current?.(); } catch {}
+      unsubMsgRef.current = null;
+      unsubDiscRef.current = null;
+    }
   }
 
-  // Back-compat shim in case other modules expect a `port` prop
-  const port = useMemo(() => {
-    async function sendLine(line) {
-      await window.bluetoothSend(line);
-    }
-    async function sendJson(obj) {
-      return window.bluetoothSend(obj);
-    }
-    return { write: sendLine, writeLine: sendLine, send: sendLine, sendJson };
-  }, []);
-
+  // On refresh/close, try to disconnect cleanly
   useEffect(() => {
-    const handler = () => {
-      try { serverRef.current?.disconnect(); } catch {}
-    };
+    const handler = () => { try { bleDisconnect(); } catch {} };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
+  }, []);
+
+  // If something else connected earlier (HMR), reflect it
+  useEffect(() => {
+    setConnected(bleIsConnected());
   }, []);
 
   return (
@@ -146,14 +119,8 @@ export default function App() {
 
       <hr style={{ margin: "12px 0" }} />
 
-      {connected ? (
-        // Controller_Panel doesn't require `port` but we pass for compatibility
-        <ControllerPanel port={port} />
-      ) : (
-        <p>
-          Click <b>Connect BLE</b> to pair with your ESP32‑S3. (Chrome/Edge, localhost/HTTPS required)
-        </p>
-      )}
+      {/* Controller is ALWAYS visible; it self-disables controls when disconnected */}
+      <ControllerPanel connected={connected} />
 
       <section style={{ marginTop: 16 }}>
         <h3 style={{ marginBottom: 8 }}>Device Log</h3>
