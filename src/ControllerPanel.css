@@ -49,6 +49,38 @@
   background: rgba(0,0,0,0.28);
 }
 
+/* Sub-selection tabs (Legs|Pelvis, Head|Neck, Tail|Spine) */
+.rex-tabs {
+  position: absolute;
+  top: 36px;               /* sits just under the title bar */
+  left: 10px;
+  z-index: 11;
+  display: flex;
+  gap: 6px;
+  background: rgba(0,0,0,0.22);
+  padding: 4px 6px;
+  border-radius: 10px;
+  backdrop-filter: blur(2px);
+}
+.rex-tabs__btn {
+  border: none;
+  padding: 4px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  color: #d1d5db;
+  background: rgba(255,255,255,0.12);
+  transition: filter 120ms ease, transform 80ms ease, background 120ms ease, color 120ms ease;
+}
+.rex-tabs__btn:hover { filter: brightness(1.08); }
+.rex-tabs__btn:active { transform: translateY(1px); }
+.rex-tabs__btn--active {
+  color: #00140c;
+  background: rgba(16,185,129,0.9);
+}
+
+/* Capability chips (read-only) */
 .rex-panel__chips {
   position: absolute;
   top: 8px; right: 10px;
@@ -63,6 +95,7 @@
 .rex-chip--on  { background: rgba(16,185,129,0.9); color: #00140c; }
 .rex-chip--off { background: rgba(107,114,128,0.4); color: #1f2937; text-decoration: line-through; }
 
+/* Image area */
 .rex-panel__imgWrap {
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center;
@@ -119,4 +152,15 @@
   .rex-panel__title { font-size: 0.8rem; }
   .rex-chip { font-size: 0.65rem; }
   .rex-edgeBtn { min-width: 48px; min-height: 48px; font-size: 20px; }
+
+  /* Slightly tighten tabs on small screens */
+  .rex-tabs {
+    top: 34px;
+    gap: 4px;
+    padding: 3px 5px;
+  }
+  .rex-tabs__btn {
+    padding: 3px 6px;
+    font-size: 11px;
+  }
 }
