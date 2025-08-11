@@ -1,7 +1,8 @@
 // src/ControllerPanel.js
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./ControllerPanel.css";
-import { sendCommand as bleSendCommand } from "./modules/ble/bleClient"; // adjust path if needed
+// Be flexible about the BLE client API that's available in your repo:
+import * as BLE from "./modules/ble/bleClient"; // supports sendCommand / sendJson / sendString
 
 /**
  * Four‑panel T‑Rex Controller (always visible)
@@ -13,7 +14,7 @@ import { sendCommand as bleSendCommand } from "./modules/ble/bleClient"; // adju
  *
  * - Edge arrows on screen bounds (◀ ▶ ▲ ▼)
  * - Select a panel & sub‑part; only its valid directions are enabled
- * - Hold arrows: sends {target, command, phase:'start'|'hold'|'stop'} (logs even if disconnected)
+ * - Hold arrows: logs the exact JSON and (if connected + transport present) transmits over BLE
  */
 
 const PANELS = [
@@ -57,11 +58,11 @@ const commandBySub = {
     spine: { up: "spine_up",     down: "spine_down"  },
   },
   fullBody: {
-    full: { up: "up", down: "down", left: "left", right: "right" }, // adjust if you prefer "full_up", etc.
+    full: { up: "up", down: "down", left: "left", right: "right" },
   },
 };
 
-export default function ControllerPanel({ connected = false, onSend }) {
+export default function ControllerPanel({ connected = false }) {
   const [selection, setSelection] = useState("tailSpine"); // which panel is active
   const [subSelection, setSubSelection] = useState({
     legsPelvis: "legs",
@@ -73,7 +74,35 @@ export default function ControllerPanel({ connected = false, onSend }) {
   const [activeDir, setActiveDir] = useState(null); // 'left'|'right'|'up'|'down'|null
   const timerRef = useRef(null);
 
-  // GIFs (put files under /public/gifs/* or change paths here)
+  // ---------- Transport plumbing ----------
+  const sendOverBLE = useCallback(async (payloadObj) => {
+    // Try the most specific function first, then graceful fallbacks.
+    try {
+      if (typeof BLE.sendCommand === "function") {
+        // Expected signature: (target, command, phase)
+        await BLE.sendCommand(payloadObj.target, payloadObj.command, payloadObj.phase);
+        return;
+      }
+      const jsonLine = JSON.stringify(payloadObj);
+      if (typeof BLE.sendJson === "function") {
+        await BLE.sendJson(payloadObj);
+        return;
+      }
+      if (typeof BLE.sendString === "function") {
+        await BLE.sendString(jsonLine);
+        return;
+      }
+      if (typeof window !== "undefined" && typeof window.bluetoothSend === "function") {
+        await window.bluetoothSend(payloadObj); // App.js shim accepts objects or strings
+        return;
+      }
+      console.warn("BLE transport not found — logging only.");
+    } catch (err) {
+      console.warn("BLE send error:", err);
+    }
+  }, []);
+
+  // ---------- GIFs ----------
   const gifs = useMemo(
     () => ({
       legsPelvis: {
@@ -99,13 +128,7 @@ export default function ControllerPanel({ connected = false, onSend }) {
     []
   );
 
-  // Sender (BLE by default; overrideable via prop)
-  const send = useCallback(
-    (target, command, phase) =>
-      (onSend ? onSend : bleSendCommand)(target, command, phase),
-    [onSend]
-  );
-
+  // ---------- Logging helpers ----------
   const buildLine = useCallback((target, command, phase) => {
     return JSON.stringify({ target, command, phase });
   }, []);
@@ -120,11 +143,11 @@ export default function ControllerPanel({ connected = false, onSend }) {
     [connected, buildLine]
   );
 
+  // ---------- Hold-to-repeat ----------
   const repeatIntervalMs = 140;
   const isAnimating = Boolean(activeDir);
-
-  // Helpers for allowed + command resolution
   const currentSub = subSelection[selection];
+
   const isAllowed = useCallback(
     (panelId, sub, dir) => Boolean(allowedBySub[panelId]?.[sub]?.[dir]),
     []
@@ -143,15 +166,17 @@ export default function ControllerPanel({ connected = false, onSend }) {
       if (!cmd) return;
 
       setActiveDir(dir);
+
+      // Log and (if connected & transport present) transmit
       logTx(selection, cmd, "start");
-      if (connected) send(selection, cmd, "start");
+      if (connected) sendOverBLE({ target: selection, command: cmd, phase: "start" });
 
       timerRef.current = setInterval(() => {
         logTx(selection, cmd, "hold");
-        if (connected) send(selection, cmd, "hold");
+        if (connected) sendOverBLE({ target: selection, command: cmd, phase: "hold" });
       }, repeatIntervalMs);
     },
-    [selection, currentSub, isAllowed, resolveCommand, connected, send, logTx]
+    [selection, currentSub, isAllowed, resolveCommand, connected, logTx, sendOverBLE]
   );
 
   const stopHold = useCallback(() => {
@@ -164,11 +189,11 @@ export default function ControllerPanel({ connected = false, onSend }) {
       const cmd = resolveCommand(selection, sub, activeDir);
       if (cmd) {
         logTx(selection, cmd, "stop");
-        if (connected) send(selection, cmd, "stop");
+        if (connected) sendOverBLE({ target: selection, command: cmd, phase: "stop" });
       }
     }
     setActiveDir(null);
-  }, [activeDir, selection, currentSub, resolveCommand, connected, send, logTx]);
+  }, [activeDir, selection, currentSub, resolveCommand, connected, logTx, sendOverBLE]);
 
   // Cancel on release/unmount
   useEffect(() => {
@@ -184,7 +209,7 @@ export default function ControllerPanel({ connected = false, onSend }) {
     };
   }, [stopHold]);
 
-  // Fixed quadrant placement
+  // ---------- Layout helpers ----------
   const posStyle = (pos) => {
     switch (pos) {
       case "tl": return { gridRow: 1, gridColumn: 1 };
@@ -234,7 +259,7 @@ export default function ControllerPanel({ connected = false, onSend }) {
         type="button"
         aria-label={label}
         className={classes}
-        disabled={!allowed} // disabled when opposite directions for current sub-part
+        disabled={!allowed}
         title={connected ? "" : "Not connected – preview only"}
         onMouseDown={() => startHold(dir)}
         onTouchStart={(e) => { e.preventDefault(); startHold(dir); }}
