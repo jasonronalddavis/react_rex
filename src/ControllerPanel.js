@@ -1,8 +1,8 @@
 // src/ControllerPanel.js
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./ControllerPanel.css";
-// Be flexible about the BLE client API that's available in your repo:
-import * as BLE from "./modules/ble/bleClient"; // supports sendCommand / sendJson / sendString
+// Flexible import: use whatever bleClient you already have
+import * as BLE from "./modules/ble/bleClient";
 
 /**
  * Four‑panel T‑Rex Controller (always visible)
@@ -13,8 +13,8 @@ import * as BLE from "./modules/ble/bleClient"; // supports sendCommand / sendJs
  *  - Full Body:   (no sub-toggle, all 4 directions)
  *
  * - Edge arrows on screen bounds (◀ ▶ ▲ ▼)
- * - Select a panel & sub‑part; only its valid directions are enabled
- * - Hold arrows: logs the exact JSON and (if connected + transport present) transmits over BLE
+ * - Select a panel & sub‑part; only valid directions are enabled
+ * - Hold arrows: logs exact ESP `cmd` string + sends over BLE (if connected)
  */
 
 const PANELS = [
@@ -24,7 +24,7 @@ const PANELS = [
   { id: "fullBody",   title: "Full Body",     pos: "br", subs: ["full"] },
 ];
 
-/** Allowed directions by sub‑part */
+/** Which directions are allowed for each sub‑part */
 const allowedBySub = {
   legsPelvis: {
     legs:   { up: true,  down: true,  left: true,  right: true  },
@@ -43,27 +43,90 @@ const allowedBySub = {
   },
 };
 
-/** Command strings by sub‑part + direction */
-const commandBySub = {
-  legsPelvis: {
-    legs:   { up: "move_forward",  down: "move_backward", left: "move_left",   right: "move_right" },
-    pelvis: { up: "pelvis_up",     down: "pelvis_down" },
-  },
-  headNeck: {
-    head: { up: "head_up",  down: "head_down" },
-    neck: { left: "neck_left", right: "neck_right" },
-  },
-  tailSpine: {
-    tail:  { left: "tail_left",  right: "tail_right" },
-    spine: { up: "spine_up",     down: "spine_down"  },
-  },
-  fullBody: {
-    full: { up: "up", down: "down", left: "left", right: "right" },
-  },
-};
+// ---------------- ESP command mapping ----------------
+//
+// Build the packet the ESP expects (CommandRouter.cpp).
+// We also console.log a concise string for debugging.
+//
+function buildEspPacket(panelId, sub, dir, phase) {
+  // Legs
+  if (panelId === "legsPelvis" && sub === "legs") {
+    const dirToCmd = {
+      up: "rex_walk_forward",
+      down: "rex_walk_backward",
+      left: "rex_turn_left",
+      right: "rex_turn_right",
+    };
+    const cmd = dirToCmd[dir];
+    if (!cmd) return null;
+    return phase === "stop" ? { cmd: "rex_stop" } : { cmd };
+  }
+
+  // Pelvis (level setpoints)
+  if (panelId === "legsPelvis" && sub === "pelvis") {
+    let level = 0.5; // neutral
+    if (phase !== "stop") {
+      if (dir === "up") level = 0.6;
+      else if (dir === "down") level = 0.4;
+      else return null;
+    }
+    return { cmd: "rex_pelvis_set", level };
+  }
+
+  // Spine
+  if (panelId === "tailSpine" && sub === "spine") {
+    const dirToCmd = { up: "rex_spine_up", down: "rex_spine_down" };
+    const cmd = dirToCmd[dir];
+    if (!cmd) return null;
+    return { cmd }; // stop = just stop sending
+  }
+
+  // Tail (level setpoints)
+  if (panelId === "tailSpine" && sub === "tail") {
+    // left -> 1.0, right -> 0.0; stop -> 0.5 neutral
+    let level = 0.5;
+    if (phase !== "stop") {
+      if (dir === "left") level = 1.0;
+      else if (dir === "right") level = 0.0;
+      else return null;
+    }
+    return { cmd: "rex_tail_set", level };
+  }
+
+  // Neck (requires router entries rex_neck_left/right)
+  if (panelId === "headNeck" && sub === "neck") {
+    const dirToCmd = { left: "rex_neck_left", right: "rex_neck_right" };
+    const cmd = dirToCmd[dir];
+    if (!cmd) return null;
+    return { cmd };
+  }
+
+  // Head (requires router entries rex_head_up/down, or map to nod)
+  if (panelId === "headNeck" && sub === "head") {
+    const dirToCmd = { up: "rex_head_up", down: "rex_head_down" };
+    const cmd = dirToCmd[dir];
+    if (!cmd) return null;
+    return { cmd };
+  }
+
+  // Full body
+  if (panelId === "fullBody" && sub === "full") {
+    const dirToCmd = {
+      up: "rex_walk_forward",
+      down: "rex_walk_backward",
+      left: "rex_turn_left",
+      right: "rex_turn_right",
+    };
+    const cmd = dirToCmd[dir];
+    if (!cmd) return null;
+    return phase === "stop" ? { cmd: "rex_stop" } : { cmd };
+  }
+
+  return null;
+}
 
 export default function ControllerPanel({ connected = false }) {
-  const [selection, setSelection] = useState("tailSpine"); // which panel is active
+  const [selection, setSelection] = useState("tailSpine"); // active panel
   const [subSelection, setSubSelection] = useState({
     legsPelvis: "legs",
     headNeck: "head",
@@ -74,35 +137,25 @@ export default function ControllerPanel({ connected = false }) {
   const [activeDir, setActiveDir] = useState(null); // 'left'|'right'|'up'|'down'|null
   const timerRef = useRef(null);
 
-  // ---------- Transport plumbing ----------
-  const sendOverBLE = useCallback(async (payloadObj) => {
-    // Try the most specific function first, then graceful fallbacks.
+  // Transport plumbing (be tolerant of whatever bleClient exposes)
+  const sendOverBLE = useCallback(async (obj) => {
     try {
+      if (typeof BLE.sendJson === "function")       return BLE.sendJson(obj);
+      if (typeof BLE.sendString === "function")     return BLE.sendString(JSON.stringify(obj));
       if (typeof BLE.sendCommand === "function") {
-        // Expected signature: (target, command, phase)
-        await BLE.sendCommand(payloadObj.target, payloadObj.command, payloadObj.phase);
-        return;
-      }
-      const jsonLine = JSON.stringify(payloadObj);
-      if (typeof BLE.sendJson === "function") {
-        await BLE.sendJson(payloadObj);
-        return;
-      }
-      if (typeof BLE.sendString === "function") {
-        await BLE.sendString(jsonLine);
-        return;
+        // If your sendCommand(target, direction, phase) exists, we still prefer JSON here:
+        return BLE.sendString(JSON.stringify(obj));
       }
       if (typeof window !== "undefined" && typeof window.bluetoothSend === "function") {
-        await window.bluetoothSend(payloadObj); // App.js shim accepts objects or strings
-        return;
+        return window.bluetoothSend(obj); // App.js shim
       }
-      console.warn("BLE transport not found — logging only.");
+      console.warn("BLE transport not found — logging only:", obj);
     } catch (err) {
       console.warn("BLE send error:", err);
     }
   }, []);
 
-  // ---------- GIFs ----------
+  // GIFs (swap with your real assets in /public/gifs/*)
   const gifs = useMemo(
     () => ({
       legsPelvis: {
@@ -128,55 +181,39 @@ export default function ControllerPanel({ connected = false }) {
     []
   );
 
-  // ---------- Logging helpers ----------
-  const buildLine = useCallback((target, command, phase) => {
-    return JSON.stringify({ target, command, phase });
-  }, []);
-
-  const logTx = useCallback(
-    (target, command, phase) => {
-      const line = buildLine(target, command, phase);
-      if (connected) console.log(`[TX] ${line}`);
-      else console.log(`[TX PREVIEW] ${line} (not connected)`);
-      return line;
-    },
-    [connected, buildLine]
-  );
-
-  // ---------- Hold-to-repeat ----------
+  // Helpers
   const repeatIntervalMs = 140;
   const isAnimating = Boolean(activeDir);
   const currentSub = subSelection[selection];
-
   const isAllowed = useCallback(
     (panelId, sub, dir) => Boolean(allowedBySub[panelId]?.[sub]?.[dir]),
     []
   );
-  const resolveCommand = useCallback(
-    (panelId, sub, dir) => commandBySub[panelId]?.[sub]?.[dir] || null,
-    []
-  );
 
+  // -------- Hold-to-repeat pipeline (builds ESP packet + logs + sends) --------
   const startHold = useCallback(
     (dir) => {
       const sub = currentSub;
       if (!isAllowed(selection, sub, dir)) return;
 
-      const cmd = resolveCommand(selection, sub, dir);
-      if (!cmd) return;
+      const pkt = buildEspPacket(selection, sub, dir, "start");
+      if (!pkt) return;
 
       setActiveDir(dir);
 
-      // Log and (if connected & transport present) transmit
-      logTx(selection, cmd, "start");
-      if (connected) sendOverBLE({ target: selection, command: cmd, phase: "start" });
+      // Log concise string and full JSON
+      console.log(`[CMD start] ${pkt.cmd}${pkt.level !== undefined ? ` level=${pkt.level.toFixed(2)}` : ""}`);
+      console.log("[ESP JSON]", pkt);
+
+      if (connected) sendOverBLE(pkt);
 
       timerRef.current = setInterval(() => {
-        logTx(selection, cmd, "hold");
-        if (connected) sendOverBLE({ target: selection, command: cmd, phase: "hold" });
+        const holdPkt = buildEspPacket(selection, sub, dir, "hold") || pkt;
+        console.log(`[CMD hold] ${holdPkt.cmd}${holdPkt.level !== undefined ? ` level=${holdPkt.level.toFixed(2)}` : ""}`);
+        if (connected) sendOverBLE(holdPkt);
       }, repeatIntervalMs);
     },
-    [selection, currentSub, isAllowed, resolveCommand, connected, logTx, sendOverBLE]
+    [selection, currentSub, isAllowed, connected, sendOverBLE]
   );
 
   const stopHold = useCallback(() => {
@@ -186,14 +223,14 @@ export default function ControllerPanel({ connected = false }) {
     }
     if (activeDir) {
       const sub = currentSub;
-      const cmd = resolveCommand(selection, sub, activeDir);
-      if (cmd) {
-        logTx(selection, cmd, "stop");
-        if (connected) sendOverBLE({ target: selection, command: cmd, phase: "stop" });
+      const stopPkt = buildEspPacket(selection, sub, activeDir, "stop");
+      if (stopPkt) {
+        console.log(`[CMD stop] ${stopPkt.cmd}${stopPkt.level !== undefined ? ` level=${stopPkt.level.toFixed(2)}` : ""}`);
+        if (connected) sendOverBLE(stopPkt);
       }
     }
     setActiveDir(null);
-  }, [activeDir, selection, currentSub, resolveCommand, connected, logTx, sendOverBLE]);
+  }, [activeDir, selection, currentSub, connected, sendOverBLE]);
 
   // Cancel on release/unmount
   useEffect(() => {
@@ -245,7 +282,6 @@ export default function ControllerPanel({ connected = false }) {
   }
 
   function Arrow({ dir, label }) {
-    // Enable/disable based on the *currently selected panel & sub*
     const allowed = isAllowed(selection, currentSub, dir);
     const active = activeDir === dir;
     const classes = [
@@ -306,7 +342,7 @@ export default function ControllerPanel({ connected = false }) {
             <span
               key={d}
               className={["rex-chip", allowedMap[d] ? "rex-chip--on" : "rex-chip--off"].join(" ")}
-              title={commandBySub[id]?.[sub]?.[d] || d}
+              title={d}
             >
               {d[0].toUpperCase()}
             </span>
@@ -328,13 +364,13 @@ export default function ControllerPanel({ connected = false }) {
 
   return (
     <div className="rex-root">
-      {/* Edge arrows (enable/disable depends on selected panel + sub) */}
+      {/* Edge arrows */}
       <Arrow dir="left" label="◀" />
       <Arrow dir="right" label="▶" />
       <Arrow dir="up" label="▲" />
       <Arrow dir="down" label="▼" />
 
-      {/* 2x2 grid in fixed quadrants */}
+      {/* 2x2 grid */}
       <div className="rex-gridWrap">
         <div className="rex-grid2x2">
           {PANELS.map((p) => (
