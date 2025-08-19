@@ -1,143 +1,161 @@
 // src/modules/ble/bleClient.js
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Nordic UART-like UUIDs (same as firmware in main.cpp / BLEServerHandler):
-//   Service: 6e400001-b5a3-f393-e0a9-e50e24dcca9e
-//   RX  (Web -> ESP32, Write):  6e400002-b5a3-f393-e0a9-e50e24dcca9e
-//   TX  (ESP32 -> Web, Notify): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
-// ─────────────────────────────────────────────────────────────────────────────
-
+// Nordic UART-like UUIDs (change if your firmware uses different ones)
 const NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-const NUS_RX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // WRITE  (Web -> ESP32)
-const NUS_TX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // NOTIFY (ESP32 -> Web)
+const NUS_TX_UUID      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // Web -> ESP32 (Write)
+const NUS_RX_UUID      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // ESP32 -> Web (Notify)
 
-let device, server, service, rxChar /* write */, txChar /* notify */;
+let device, server, service, txChar, rxChar;
 const messageHandlers = new Set();
 const disconnectHandlers = new Set();
 
+// ---------------- Write queue to prevent "GATT operation already in progress" -----
+class WriteQueue {
+  constructor() { this._chain = Promise.resolve(); }
+  enqueue(task) {
+    // Always run tasks sequentially
+    this._chain = this._chain.then(task, task);
+    return this._chain;
+  }
+}
+const writeQueue = new WriteQueue();
+
+async function writeChunkSafe(buf) {
+  // Prefer without-response if available; fall back otherwise.
+  if (!txChar) throw new Error("Not connected");
+  const hasNoRsp = typeof txChar.writeValueWithoutResponse === "function";
+  // Retry once if the adapter is busy
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (hasNoRsp) {
+        await txChar.writeValueWithoutResponse(buf);
+      } else {
+        await txChar.writeValue(buf);
+      }
+      return;
+    } catch (err) {
+      const msg = String(err?.message || err);
+      // Only retry for the specific busy case
+      if (attempt === 0 && /GATT operation already in progress/i.test(msg)) {
+        await new Promise(r => setTimeout(r, 20)); // tiny backoff
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+// -------------------------------------------------------------------------------
+
 export async function connect({
-  // Accept both current and legacy name prefixes
   namePrefix = "Robo_Rex",
-  altNamePrefix = "Robo_Rex_ESP32S3",
   serviceUuid = NUS_SERVICE_UUID,
 } = {}) {
-  if (!navigator.bluetooth) {
-    throw new Error("Web Bluetooth not supported in this browser.");
-  }
+  if (!navigator.bluetooth) throw new Error("Web Bluetooth not supported in this browser.");
 
-  const filters = [];
-  if (namePrefix)    filters.push({ namePrefix });
-  if (altNamePrefix) filters.push({ namePrefix: altNamePrefix });
-  if (filters.length === 0) filters.push({ services: [serviceUuid] });
+  // Accept both legacy and new advertised names
+  const filters = [{ namePrefix }, { namePrefix: "Robo_Rex_ESP32S3" }];
 
   device = await navigator.bluetooth.requestDevice({
     filters,
     optionalServices: [serviceUuid],
   });
 
-  server  = await device.gatt.connect();
+  server = await device.gatt.connect();
   service = await server.getPrimaryService(serviceUuid);
+  txChar  = await service.getCharacteristic(NUS_TX_UUID);
+  rxChar  = await service.getCharacteristic(NUS_RX_UUID);
 
-  // Wire up characteristics (RX = write, TX = notify)
-  rxChar = await service.getCharacteristic(NUS_RX_UUID);
-  txChar = await service.getCharacteristic(NUS_TX_UUID);
-
-  await txChar.startNotifications();
-  txChar.addEventListener("characteristicvaluechanged", handleNotify);
-
+  await rxChar.startNotifications();
+  rxChar.addEventListener("characteristicvaluechanged", handleNotify);
   device.addEventListener("gattserverdisconnected", handleDisconnected);
 
-  console.log("✅ BLE connected to", device.name || "(unnamed)");
-  return { device, server, service, rxChar, txChar };
+  console.log("✅ BLE connected");
+  return { device, server, txChar, rxChar };
 }
 
 export async function disconnect() {
-  try { await txChar?.stopNotifications(); } catch {}
+  try { await rxChar?.stopNotifications(); } catch {}
   try { await server?.disconnect(); } catch {}
   cleanupRefs();
   console.warn("🔌 BLE disconnected");
 }
 
 export function isConnected() {
-  return !!(server && server.connected && rxChar);
+  return !!(server && server.connected && txChar);
 }
 
-// ─────────────────────── Subscriptions ───────────────────────
-
-/** Subscribe to text messages coming from ESP32 (TX notify). */
+/** Subscribe to RX messages; returns an unsubscribe function. */
 export function onMessage(fn) {
   messageHandlers.add(fn);
   return () => messageHandlers.delete(fn);
 }
 
-/** Subscribe to disconnect events. */
+/** Subscribe to disconnect event; returns an unsubscribe function. */
 export function onDisconnect(fn) {
   disconnectHandlers.add(fn);
   return () => disconnectHandlers.delete(fn);
 }
 
-// ─────────────────────── Sending helpers ───────────────────────
-
-/**
- * Low-level send of a line. Appends '\n' and chunks under typical 20B MTU.
- * Writes to RX (write) characteristic on the ESP32 side.
- */
+/** Low-level line send with newline + MTU chunking, serialized via queue. */
 export async function sendString(line) {
   if (!isConnected()) throw new Error("Not connected");
   const enc = new TextEncoder();
   const bytes = enc.encode(line.endsWith("\n") ? line : line + "\n");
-  const CHUNK = 18; // conservative to fit 20B MTU devices
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    await rxChar.writeValue(bytes.slice(i, i + CHUNK));
-  }
+
+  // Keep under typical 20-byte ATT MTU payload (use 18-19 to be safe)
+  const CHUNK = 18;
+
+  return writeQueue.enqueue(async () => {
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      const slice = bytes.slice(i, i + CHUNK);
+      await writeChunkSafe(slice);
+      // Small pacing helps on some stacks
+      if (i + CHUNK < bytes.length) await new Promise(r => setTimeout(r, 2));
+    }
+  });
 }
 
-/** JSON helper (adds newline automatically). */
 export async function sendJson(obj) {
   return sendString(JSON.stringify(obj));
 }
 
 /**
- * Canonical control message used by the firmware CommandRouter:
+ * Canonical control API:
  *   { target, part, command, phase }
- * - target: "legsPelvis" | "headNeck" | "tailSpine" | "fullBody"
- * - part:   "legs" | "pelvis" | "head" | "neck" | "tail" | "spine" | "full"
- * - command: e.g. "move_forward", "neck_left", "spine_up", etc.
- * - phase:  "start" | "hold" | "stop" (or omit if sending one-shots)
+ * Matches firmware CommandRouter contract.
  */
 export async function sendControl(target, part, command, phase) {
   return sendJson({ target, part, command, phase });
 }
 
 /**
- * Back-compat shim for older UI that called (target, direction, phase).
- * It maps to part="full" so firmware can still act on generic moves.
+ * BACKWARD-COMPAT shim (deprecated):
+ * Older UI called sendCommand(target, direction, phase).
  */
 export async function sendCommand(target, direction, phase) {
   return sendControl(target, "full", direction, phase);
 }
 
-/** Optional: generic action wrapper if your firmware routes on a 'type' field. */
+/** Optional: generic action wrapper if you prefer action-types in firmware. */
 export async function sendAction(type, payload = {}) {
   return sendJson({ type, ...payload });
 }
 
-// ─────────────────────── Internals ───────────────────────
+// --------------------------- internals ---------------------------
 
 function handleNotify(e) {
   const dv = e.target?.value || new DataView(new ArrayBuffer(0));
   const text = new TextDecoder().decode(dv).trim();
-  // Fan out to listeners first
   for (const fn of messageHandlers) {
-    try { fn(text, dv); } catch (err) { /* ignore */ }
+    try { fn(text, dv); } catch {}
   }
-  // Also log for convenience
   if (text) console.log("🦖 Rex → Web:", text);
 }
 
 function handleDisconnected() {
   for (const fn of disconnectHandlers) {
-    try { fn(); } catch (err) { /* ignore */ }
+    try { fn(); } catch {}
   }
   cleanupRefs();
 }
@@ -146,18 +164,6 @@ function cleanupRefs() {
   device = undefined;
   server = undefined;
   service = undefined;
-  rxChar = undefined;
   txChar = undefined;
+  rxChar = undefined;
 }
-
-// ─────────────────────── Convenience (optional) ───────────────────────
-
-/**
- * Tiny helper you can assign in App.jsx to mirror BLE availability into UI.
- * Usage:
- *   onMessage(line => addToLog(line));
- *   onDisconnect(() => setConnected(false));
- */
-export const status = {
-  get connected() { return isConnected(); },
-};
